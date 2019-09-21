@@ -36,7 +36,7 @@ describe 'WebsocketController', ->
 			"metrics-sharelatex": @metrics =
 				inc: sinon.stub()
 				set: sinon.stub()
-				
+			"./RoomManager": @RoomManager = {}
 	
 	afterEach ->
 		tk.reset()
@@ -54,6 +54,7 @@ describe 'WebsocketController', ->
 				@privilegeLevel = "owner"
 				@ConnectedUsersManager.updateUserPosition = sinon.stub().callsArg(4)
 				@WebApiManager.joinProject = sinon.stub().callsArgWith(2, null, @project, @privilegeLevel)
+				@RoomManager.joinProject = sinon.stub().callsArg(2)
 				@WebsocketController.joinProject @client, @user, @project_id, @callback
 				
 			it "should load the project from web", ->
@@ -62,7 +63,7 @@ describe 'WebsocketController', ->
 					.should.equal true
 					
 			it "should join the project room", ->
-				@client.join.calledWith(@project_id).should.equal true
+				@RoomManager.joinProject.calledWith(@client, @project_id).should.equal true
 					
 			it "should set the privilege level on the client", ->
 				@client.set.calledWith("privilege_level", @privilegeLevel).should.equal true
@@ -116,12 +117,16 @@ describe 'WebsocketController', ->
 				@callback
 					.calledWith(new Error("not authorized"))
 					.should.equal true
-	
+
+			it "should not log an error", ->
+				@logger.error.called.should.equal false
+
 	describe "leaveProject", ->
 		beforeEach ->
 			@DocumentUpdaterManager.flushProjectToMongoAndDelete = sinon.stub().callsArg(1)
 			@ConnectedUsersManager.markUserAsDisconnected = sinon.stub().callsArg(2)
 			@WebsocketLoadBalancer.emitToRoom = sinon.stub()
+			@RoomManager.leaveProjectAndDocs = sinon.stub()
 			@clientsInRoom = []
 			@io =
 				sockets:
@@ -157,6 +162,11 @@ describe 'WebsocketController', ->
 			it "should increment the leave-project metric", ->
 				@metrics.inc.calledWith("editor.leave-project").should.equal true
 			
+			it "should track the disconnection in RoomManager", ->
+				@RoomManager.leaveProjectAndDocs
+					.calledWith(@client)
+					.should.equal true
+
 		describe "when the project is not empty", ->
 			beforeEach ->
 				@clientsInRoom = ["mock-remaining-client"]
@@ -227,6 +237,7 @@ describe 'WebsocketController', ->
 			@AuthorizationManager.addAccessToDoc = sinon.stub()
 			@AuthorizationManager.assertClientCanViewProject = sinon.stub().callsArgWith(1, null)
 			@DocumentUpdaterManager.getDocument = sinon.stub().callsArgWith(3, null, @doc_lines, @version, @ranges, @ops)
+			@RoomManager.joinDoc = sinon.stub().callsArg(2)
 
 		describe "works", ->
 			beforeEach ->
@@ -248,8 +259,8 @@ describe 'WebsocketController', ->
 					.should.equal true
 
 			it "should join the client to room for the doc_id", ->
-				@client.join
-					.calledWith(@doc_id)
+				@RoomManager.joinDoc
+					.calledWith(@client, @doc_id)
 					.should.equal true
 
 			it "should call the callback with the lines, version, ranges and ops", ->
@@ -327,11 +338,12 @@ describe 'WebsocketController', ->
 		beforeEach ->
 			@doc_id = "doc-id-123"			
 			@client.params.project_id = @project_id
+			@RoomManager.leaveDoc = sinon.stub()
 			@WebsocketController.leaveDoc @client, @doc_id, @callback
 			
 		it "should remove the client from the doc_id room", ->
-			@client.leave
-				.calledWith(@doc_id).should.equal true
+			@RoomManager.leaveDoc
+				.calledWith(@client, @doc_id).should.equal true
 				
 		it "should call the callback", ->
 			@callback.called.should.equal true
@@ -343,18 +355,26 @@ describe 'WebsocketController', ->
 		beforeEach ->
 			@client.params.project_id = @project_id
 			@users = ["mock", "users"]
+			@WebsocketLoadBalancer.emitToRoom = sinon.stub()
 			@ConnectedUsersManager.getConnectedUsers = sinon.stub().callsArgWith(1, null, @users)
 			
 		describe "when authorized", ->
-			beforeEach ->
+			beforeEach (done) ->
 				@AuthorizationManager.assertClientCanViewProject = sinon.stub().callsArgWith(1, null)
-				@WebsocketController.getConnectedUsers @client, @callback
+				@WebsocketController.getConnectedUsers @client, (args...) =>
+					@callback(args...)
+					done()
 				
 			it "should check that the client is authorized to view the project", ->
 				@AuthorizationManager.assertClientCanViewProject
 					.calledWith(@client)
 					.should.equal true
-					
+
+			it "should broadcast a request to update the client list", ->
+				@WebsocketLoadBalancer.emitToRoom
+					.calledWith(@project_id, "clientTracking.refresh")
+					.should.equal true
+
 			it "should get the connected users for the project", ->
 				@ConnectedUsersManager.getConnectedUsers
 					.calledWith(@project_id)
@@ -426,7 +446,7 @@ describe 'WebsocketController', ->
 					doc_id: @doc_id
 				}).should.equal true
 				done()
-				
+
 			it "should increment the update-client-position metric at 0.1 frequency", ->
 				@metrics.inc.calledWith("editor.update-client-position", 0.1).should.equal true
 
@@ -509,6 +529,30 @@ describe 'WebsocketController', ->
 
 			it "should increment the update-client-position metric at 0.1 frequency", ->
 				@metrics.inc.calledWith("editor.update-client-position", 0.1).should.equal true
+		describe "with a logged in user who has no names set", ->
+			beforeEach ->
+				@clientParams = {
+					project_id: @project_id
+					first_name: undefined
+					last_name: undefined
+					email: @email = "joe@example.com"
+					user_id: @user_id = "user-id-123"
+				}
+				@client.get = (param, callback) => callback null, @clientParams[param]
+				@WebsocketController.updateClientPosition @client, @update
+
+			it "should send the update to the project name with no name", ->
+				@WebsocketLoadBalancer.emitToRoom
+					.calledWith(@project_id, "clientTracking.clientUpdated", {
+						doc_id: @doc_id,
+						id: @client.id,
+						user_id: @user_id,
+						name: "",
+						row: @row,
+						column: @column,
+						email: @email
+					})
+					.should.equal true
 
 
 		describe "with an anonymous user", ->
@@ -519,17 +563,17 @@ describe 'WebsocketController', ->
 				@client.get = (param, callback) => callback null, @clientParams[param]
 				@WebsocketController.updateClientPosition @client, @update
 
-			it "should send the update to the project room with an anonymous name", ->
+			it "should send the update to the project room with no name", ->
 				@WebsocketLoadBalancer.emitToRoom
 					.calledWith(@project_id, "clientTracking.clientUpdated", {
 						doc_id: @doc_id,
 						id: @client.id
-						name: "Anonymous"
+						name: ""
 						row: @row
 						column: @column
 					})
 					.should.equal true
-				
+
 			it "should not send cursor data to the connected user manager", (done)->
 				@ConnectedUsersManager.updateUserPosition.called.should.equal false
 				done()
@@ -559,12 +603,6 @@ describe 'WebsocketController', ->
 
 			it "should call the callback", ->
 				@callback.called.should.equal true
-
-			it "should update the active users metric", ->
-				@metrics.set.calledWith("editor.active-users", @user_id).should.equal true
-			
-			it "should update the active projects metric", ->
-				@metrics.set.calledWith("editor.active-projects", @project_id).should.equal true
 			
 			it "should increment the doc updates", ->
 				@metrics.inc.calledWith("editor.doc-update").should.equal true

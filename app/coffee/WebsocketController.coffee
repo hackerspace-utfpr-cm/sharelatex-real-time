@@ -5,6 +5,7 @@ AuthorizationManager = require "./AuthorizationManager"
 DocumentUpdaterManager = require "./DocumentUpdaterManager"
 ConnectedUsersManager = require "./ConnectedUsersManager"
 WebsocketLoadBalancer = require "./WebsocketLoadBalancer"
+RoomManager = require "./RoomManager"
 Utils = require "./Utils"
 
 module.exports = WebsocketController =
@@ -22,10 +23,9 @@ module.exports = WebsocketController =
 
 			if !privilegeLevel or privilegeLevel == ""
 				err = new Error("not authorized")
-				logger.error {err, project_id, user_id, client_id: client.id}, "user is not authorized to join project"
+				logger.warn {err, project_id, user_id, client_id: client.id}, "user is not authorized to join project"
 				return callback(err)
-				
-			client.join project_id
+
 
 			client.set("privilege_level", privilegeLevel)
 			client.set("user_id", user_id)
@@ -38,8 +38,9 @@ module.exports = WebsocketController =
 			client.set("signup_date", user?.signUpDate)
 			client.set("login_count", user?.loginCount)
 			
-			callback null, project, privilegeLevel, WebsocketController.PROTOCOL_VERSION
-			logger.log {user_id, project_id, client_id: client.id}, "user joined project"
+			RoomManager.joinProject client, project_id, (err) ->
+				logger.log {user_id, project_id, client_id: client.id}, "user joined project"
+				callback null, project, privilegeLevel, WebsocketController.PROTOCOL_VERSION
 			
 			# No need to block for setting the user as connected in the cursor tracking
 			ConnectedUsersManager.updateUserPosition project_id, client.id, user, null, () ->
@@ -52,6 +53,10 @@ module.exports = WebsocketController =
 		metrics.inc "editor.leave-project"
 		Utils.getClientAttributes client, ["project_id", "user_id"], (error, {project_id, user_id}) ->
 			return callback(error) if error?
+
+			logger.log {project_id, user_id, client_id: client.id}, "client leaving project"
+			WebsocketLoadBalancer.emitToRoom project_id, "clientTracking.clientDisconnected", client.id
+			
 			# bail out if the client had not managed to authenticate or join
 			# the project.  Prevents downstream errors in docupdater from
 			# flushProjectToMongoAndDelete with null project_id.
@@ -61,15 +66,13 @@ module.exports = WebsocketController =
 			if not project_id?
 				logger.log {user_id: user_id, client_id: client.id}, "client leaving, not in project"
 				return callback()
-
-			logger.log {project_id, user_id, client_id: client.id}, "client leaving project"
-			WebsocketLoadBalancer.emitToRoom project_id, "clientTracking.clientDisconnected", client.id
 		
 			# We can do this in the background
 			ConnectedUsersManager.markUserAsDisconnected project_id, client.id, (err) ->
 				if err?
 					logger.error {err, project_id, user_id, client_id: client.id}, "error marking client as disconnected"
 					
+			RoomManager.leaveProjectAndDocs(client)
 			setTimeout () ->
 				remainingClients = io.sockets.clients(project_id)
 				if remainingClients.length == 0
@@ -89,47 +92,49 @@ module.exports = WebsocketController =
 					
 			AuthorizationManager.assertClientCanViewProject client, (error) ->
 				return callback(error) if error?
-				DocumentUpdaterManager.getDocument project_id, doc_id, fromVersion, (error, lines, version, ranges, ops) ->
+				# ensure the per-doc applied-ops channel is subscribed before sending the
+				# doc to the client, so that no events are missed.
+				RoomManager.joinDoc client, doc_id, (error) ->
 					return callback(error) if error?
+					DocumentUpdaterManager.getDocument project_id, doc_id, fromVersion, (error, lines, version, ranges, ops) ->
+						return callback(error) if error?
 
-					# Encode any binary bits of data so it can go via WebSockets
-					# See http://ecmanaut.blogspot.co.uk/2006/07/encoding-decoding-utf8-in-javascript.html
-					encodeForWebsockets = (text) -> unescape(encodeURIComponent(text))
-					escapedLines = []
-					for line in lines
-						try
-							line = encodeForWebsockets(line)
-						catch err
-							logger.err {err, project_id, doc_id, fromVersion, line, client_id: client.id}, "error encoding line uri component"
-							return callback(err)
-						escapedLines.push line
-					if options.encodeRanges
-						try
-							for comment in ranges?.comments or []
-								comment.op.c = encodeForWebsockets(comment.op.c) if comment.op.c?
-							for change in ranges?.changes or []
-								change.op.i = encodeForWebsockets(change.op.i) if change.op.i?
-								change.op.d = encodeForWebsockets(change.op.d) if change.op.d?
-						catch err
-							logger.err {err, project_id, doc_id, fromVersion, ranges, client_id: client.id}, "error encoding range uri component"
-							return callback(err)
+						# Encode any binary bits of data so it can go via WebSockets
+						# See http://ecmanaut.blogspot.co.uk/2006/07/encoding-decoding-utf8-in-javascript.html
+						encodeForWebsockets = (text) -> unescape(encodeURIComponent(text))
+						escapedLines = []
+						for line in lines
+							try
+								line = encodeForWebsockets(line)
+							catch err
+								logger.err {err, project_id, doc_id, fromVersion, line, client_id: client.id}, "error encoding line uri component"
+								return callback(err)
+							escapedLines.push line
+						if options.encodeRanges
+							try
+								for comment in ranges?.comments or []
+									comment.op.c = encodeForWebsockets(comment.op.c) if comment.op.c?
+								for change in ranges?.changes or []
+									change.op.i = encodeForWebsockets(change.op.i) if change.op.i?
+									change.op.d = encodeForWebsockets(change.op.d) if change.op.d?
+							catch err
+								logger.err {err, project_id, doc_id, fromVersion, ranges, client_id: client.id}, "error encoding range uri component"
+								return callback(err)
 
-					AuthorizationManager.addAccessToDoc client, doc_id
-					client.join(doc_id)
-					callback null, escapedLines, version, ops, ranges
-					logger.log {user_id, project_id, doc_id, fromVersion, client_id: client.id}, "client joined doc"
+						AuthorizationManager.addAccessToDoc client, doc_id
+						logger.log {user_id, project_id, doc_id, fromVersion, client_id: client.id}, "client joined doc"
+						callback null, escapedLines, version, ops, ranges
 					
 	leaveDoc: (client, doc_id, callback = (error) ->) ->
 		metrics.inc "editor.leave-doc"
 		Utils.getClientAttributes client, ["project_id", "user_id"], (error, {project_id, user_id}) ->
 			logger.log {user_id, project_id, doc_id, client_id: client.id}, "client leaving doc"
-			client.leave doc_id
+			RoomManager.leaveDoc(client, doc_id)
 			# we could remove permission when user leaves a doc, but because
 			# the connection is per-project, we continue to allow access
 			# after the initial joinDoc since we know they are already authorised.
 			## AuthorizationManager.removeAccessToDoc client, doc_id
 			callback()
-		
 	updateClientPosition: (client, cursorData, callback = (error) ->) ->
 		metrics.inc "editor.update-client-position", 0.1
 		Utils.getClientAttributes client, [
@@ -137,7 +142,7 @@ module.exports = WebsocketController =
 		], (error, {project_id, first_name, last_name, email, user_id}) ->
 			return callback(error) if error?
 			logger.log {user_id, project_id, client_id: client.id, cursorData: cursorData}, "updating client position"
-					
+
 			AuthorizationManager.assertClientCanViewProjectAndDoc client, cursorData.doc_id, (error) ->
 				if error?
 					logger.warn {err: error, client_id: client.id, project_id, user_id}, "silently ignoring unauthorized updateClientPosition. Client likely hasn't called joinProject yet."
@@ -145,13 +150,19 @@ module.exports = WebsocketController =
 				cursorData.id      = client.id
 				cursorData.user_id = user_id if user_id?
 				cursorData.email   = email   if email?
-				if first_name or last_name
+				# Don't store anonymous users in redis to avoid influx
+				if !user_id or user_id == 'anonymous-user'
+					cursorData.name = ""
+					callback()
+				else
 					cursorData.name = if first_name && last_name
 						"#{first_name} #{last_name}"
 					else if first_name
 						first_name
 					else if last_name
 						last_name
+					else
+						""
 					ConnectedUsersManager.updateUserPosition(project_id, client.id, {
 						first_name: first_name,
 						last_name:  last_name,
@@ -162,11 +173,9 @@ module.exports = WebsocketController =
 						column: cursorData.column,
 						doc_id: cursorData.doc_id
 					}, callback)
-				else
-					cursorData.name = "Anonymous"
-					callback()
 				WebsocketLoadBalancer.emitToRoom(project_id, "clientTracking.clientUpdated", cursorData)
 
+	CLIENT_REFRESH_DELAY: 1000
 	getConnectedUsers: (client, callback = (error, users) ->) ->
 		metrics.inc "editor.get-connected-users"
 		Utils.getClientAttributes client, ["project_id", "user_id"], (error, {project_id, user_id}) ->
@@ -175,11 +184,13 @@ module.exports = WebsocketController =
 			logger.log {user_id, project_id, client_id: client.id}, "getting connected users"
 			AuthorizationManager.assertClientCanViewProject client, (error) ->
 				return callback(error) if error?
-				ConnectedUsersManager.getConnectedUsers project_id, (error, users) ->
-					return callback(error) if error?
-					callback null, users
-					logger.log {user_id, project_id, client_id: client.id}, "got connected users"
-					
+				WebsocketLoadBalancer.emitToRoom project_id, 'clientTracking.refresh'
+				setTimeout () ->
+					ConnectedUsersManager.getConnectedUsers project_id, (error, users) ->
+						return callback(error) if error?
+						callback null, users
+						logger.log {user_id, project_id, client_id: client.id}, "got connected users"
+				, WebsocketController.CLIENT_REFRESH_DELAY
 
 	applyOtUpdate: (client, doc_id, update, callback = (error) ->) ->
 		Utils.getClientAttributes client, ["user_id", "project_id"], (error, {user_id, project_id}) ->
@@ -197,8 +208,6 @@ module.exports = WebsocketController =
 				update.meta.source = client.id
 				update.meta.user_id = user_id
 				metrics.inc "editor.doc-update", 0.3
-				metrics.set "editor.active-projects", project_id, 0.3
-				metrics.set "editor.active-users", user_id, 0.3
 
 				logger.log {user_id, doc_id, project_id, client_id: client.id, version: update.v}, "sending update to doc updater"
 

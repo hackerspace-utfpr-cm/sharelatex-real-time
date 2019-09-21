@@ -21,6 +21,9 @@ module.exports = Router =
 				attrs[key] = value
 			attrs.client_id = client.id
 			attrs.err = error
+			if error.name == "CodedError"
+				logger.warn attrs, error.message, code: error.code
+				return callback {message: error.message, code: error.code}
 			if error.message in ["not authorized", "doc updater could not load requested ops", "no project_id found on client"]
 				logger.warn attrs, error.message
 				return callback {message: error.message}
@@ -39,6 +42,11 @@ module.exports = Router =
 		app.post "/drain", httpAuth, HttpApiController.startDrain
 
 		session.on 'connection', (error, client, session) ->
+			if settings.shutDownInProgress
+				client.emit("connectionRejected", {message: "retry"})
+				client.disconnect()
+				return
+
 			if client? and error?.message?.match(/could not look up session by key/)
 				logger.warn err: error, client: client?, session: session?, "invalid session"
 				# tell the client to reauthenticate if it has an invalid session key
@@ -56,6 +64,7 @@ module.exports = Router =
 			client.emit("connectionAccepted")
 
 			metrics.inc('socket-io.connection')
+			metrics.gauge('socket-io.clients', io.sockets.clients()?.length)
 
 			logger.log session: session, client_id: client.id, "client connected"
 
@@ -77,6 +86,7 @@ module.exports = Router =
 
 			client.on "disconnect", () ->
 				metrics.inc('socket-io.disconnect')
+				metrics.gauge('socket-io.clients', io.sockets.clients()?.length - 1)
 				WebsocketController.leaveProject io, client, (err) ->
 					if err?
 						Router._handleError null, err, client, "leaveProject"
